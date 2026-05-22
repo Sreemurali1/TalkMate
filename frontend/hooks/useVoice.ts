@@ -1,12 +1,34 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
+
+export interface Message {
+  role: 'user' | 'ai';
+  text: string;
+}
+
+async function saveSession(payload: {
+  duration: number;
+  transcript: string;
+  scenario: string;
+}) {
+  try {
+    await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.error('Failed to save session:', err);
+  }
+}
 
 export function useVoice() {
   const [isConnected, setIsConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [messages, setMessages] = useState<{ role: string; text: string }[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [sessionActive, setSessionActive] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -14,11 +36,21 @@ export function useVoice() {
   const processingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const sessionStartRef = useRef<number | null>(null);
+  const messagesRef = useRef<Message[]>([]);
+
+  // Keep messagesRef in sync so endSession closure has latest messages
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   // Unlock AudioContext on first user gesture — required for mobile autoplay policy
   const unlockAudio = () => {
     if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      audioContextRef.current = new (
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+      )();
     }
     if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
@@ -40,6 +72,21 @@ export function useVoice() {
     }, 60000);
   };
 
+  /** Call this to end the session and persist it to the backend */
+  const endSession = useCallback(async () => {
+    if (!sessionStartRef.current) return;
+
+    const duration = Math.round((Date.now() - sessionStartRef.current) / 1000);
+    sessionStartRef.current = null;
+    setSessionActive(false);
+
+    const transcript = messagesRef.current
+      .map((m) => `${m.role === 'user' ? 'You' : 'AI'}: ${m.text}`)
+      .join('\n');
+
+    await saveSession({ duration, transcript, scenario: 'free' });
+  }, []);
+
   useEffect(() => {
     const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'http://localhost:3001';
 
@@ -55,11 +102,9 @@ export function useVoice() {
     socket.on('connect_error', (err) => console.error('Connection error:', err));
 
     socket.on('ai_response', (data: { response_text: string; audio_base64: string }) => {
-      setMessages(prev => [...prev, { role: 'ai', text: data.response_text }]);
+      setMessages((prev) => [...prev, { role: 'ai', text: data.response_text }]);
       stopProcessing();
 
-      // Decode base64 and play via Web Audio API — works on mobile without autoplay restrictions
-      // because it runs in the context of the socket event which follows a user gesture
       try {
         const ctx = audioContextRef.current;
         if (!ctx) return;
@@ -70,16 +115,20 @@ export function useVoice() {
           audioArray[i] = audioData.charCodeAt(i);
         }
 
-        ctx.decodeAudioData(audioArray.buffer, (buffer) => {
-          const source = ctx.createBufferSource();
-          source.buffer = buffer;
-          source.connect(ctx.destination);
-          source.start(0);
-        }, (err) => {
-          console.error('Audio decode error:', err);
-          const audio = new Audio(`data:audio/mp3;base64,${data.audio_base64}`);
-          audio.play().catch(e => console.error('Audio play fallback error:', e));
-        });
+        ctx.decodeAudioData(
+          audioArray.buffer,
+          (buffer) => {
+            const source = ctx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(ctx.destination);
+            source.start(0);
+          },
+          (err) => {
+            console.error('Audio decode error:', err);
+            const audio = new Audio(`data:audio/mp3;base64,${data.audio_base64}`);
+            audio.play().catch((e) => console.error('Audio play fallback error:', e));
+          },
+        );
       } catch (err) {
         console.error('Audio setup error:', err);
       }
@@ -104,7 +153,13 @@ export function useVoice() {
     }
     if (isProcessing) return;
     setError(null);
-    unlockAudio(); // unlock AudioContext on user gesture
+    unlockAudio();
+
+    // Mark session start on first recording
+    if (!sessionStartRef.current) {
+      sessionStartRef.current = Date.now();
+      setSessionActive(true);
+    }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -125,7 +180,7 @@ export function useVoice() {
       };
 
       mediaRecorder.onstop = async () => {
-        streamRef.current?.getTracks().forEach(t => t.stop());
+        streamRef.current?.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
 
         const audioBlob = new Blob(chunksRef.current, { type: mimeType });
@@ -151,10 +206,9 @@ export function useVoice() {
             throw new Error(`STT failed: ${errText}`);
           }
 
-          const { transcript } = await sttRes.json();
-          setMessages(prev => [...prev, { role: 'user', text: transcript }]);
+          const { transcript } = (await sttRes.json()) as { transcript: string };
+          setMessages((prev) => [...prev, { role: 'user', text: transcript }]);
           socketRef.current?.emit('transcript', { text: transcript });
-
         } catch (err) {
           setError(err instanceof Error ? err.message : 'Transcription failed');
           stopProcessing();
@@ -163,7 +217,6 @@ export function useVoice() {
 
       mediaRecorder.start(100);
       setIsRecording(true);
-
     } catch (err) {
       console.error('Microphone error:', err);
       setError('Microphone not available. Please allow mic access and try again.');
@@ -188,5 +241,14 @@ export function useVoice() {
     }
   };
 
-  return { isConnected, isRecording, isProcessing, error, messages, toggleRecording };
+  return {
+    isConnected,
+    isRecording,
+    isProcessing,
+    error,
+    messages,
+    sessionActive,
+    toggleRecording,
+    endSession,
+  };
 }

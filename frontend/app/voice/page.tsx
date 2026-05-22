@@ -1,9 +1,26 @@
 'use client';
 
 import { useVoice } from '../../hooks/useVoice';
+import { useRouter } from 'next/navigation';
 
 export default function VoicePage() {
-  const { isConnected, isRecording, isProcessing, error, messages, toggleRecording } = useVoice();
+  const {
+    isConnected,
+    isRecording,
+    isProcessing,
+    error,
+    messages,
+    sessionActive,
+    toggleRecording,
+    endSession,
+  } = useVoice();
+
+  const router = useRouter();
+
+  const handleEndSession = async () => {
+    await endSession();
+    router.push('/dashboard');
+  };
 
   const getButtonLabel = () => {
     if (isProcessing) return 'Processing...';
@@ -14,14 +31,24 @@ export default function VoicePage() {
   return (
     <div className="min-h-screen bg-gray-950 text-white flex flex-col items-center justify-center p-8">
 
-      {/* Status */}
-      <div className="mb-4 text-sm text-gray-400">
-        {isConnected ? '🟢 Connected' : '🔴 Disconnected'}
+      {/* Header row */}
+      <div className="w-full max-w-xl flex items-center justify-between mb-4">
+        <div className="text-sm text-gray-400">
+          {isConnected ? '🟢 Connected' : '🔴 Disconnected'}
+        </div>
+        {sessionActive && (
+          <button
+            onClick={handleEndSession}
+            className="rounded-lg bg-gray-800 px-4 py-1.5 text-sm text-gray-300 hover:bg-gray-700 transition"
+          >
+            End session
+          </button>
+        )}
       </div>
 
       {/* Error */}
       {error && (
-        <div className="mb-4 text-sm text-red-400 bg-red-900/30 px-4 py-2 rounded-lg text-center">
+        <div className="mb-4 w-full max-w-xl text-sm text-red-400 bg-red-900/30 px-4 py-2 rounded-lg text-center">
           ⚠️ {error}
         </div>
       )}
@@ -35,11 +62,11 @@ export default function VoicePage() {
         )}
         {messages.map((msg, i) => (
           <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            <div className={`px-4 py-2 rounded-2xl max-w-xs text-sm ${
-              msg.role === 'user'
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-700 text-white'
-            }`}>
+            <div
+              className={`px-4 py-2 rounded-2xl max-w-xs text-sm ${
+                msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-white'
+              }`}
+            >
               {msg.text}
             </div>
           </div>
